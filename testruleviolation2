@@ -1,0 +1,227 @@
+import os
+import requests
+import time
+from datetime import datetime, timedelta, timezone
+from github import Github, Auth, GithubIntegration
+from app.config.settings import settings
+from app.core.logger import get_logger
+from typing import Optional, Dict, List
+from jose import jwt as jose_jwt
+import re
+import urllib.parse
+
+logger = get_logger(__name__)
+
+
+class GitHubAppService:
+    def __init__(self):
+        self.app_id = settings.GITHUB_APP_ID
+        self.private_key_path = settings.GITHUB_PRIVATE_KEY_PATH
+        try:
+            with open(self.private_key_path, "r") as key_file:
+                self.private_key = key_file.read()
+        except FileNotFoundError:
+            logger.error(f"GitHub private key file not found at {self.private_key_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read GitHub private key file at {self.private_key_path}: {e}")
+            raise
+        logger.debug(f"GitHubAppService initialized with APP_ID={self.app_id} and PRIVATE_KEY_PATH={self.private_key_path}")
+        
+    def get_app_auth(self):
+        return Auth.AppAuth(self.app_id, self.private_key)
+
+    def get_app_auth_client(self):
+        """Returns a Github client authenticated as the app itself."""
+        return Github(auth=self.get_app_auth())
+
+    def get_integration_client(self):
+        """Returns a GithubIntegration client for managing app installations."""
+        return GithubIntegration(self.app_id, self.private_key)
+
+    def get_installation_client(self, installation_id: int) -> str:
+        integration_client = self.get_integration_client()
+        installation_token_obj = integration_client.get_access_token(installation_id)
+        return installation_token_obj.token
+
+    def get_installation_id_by_repo(self, owner: str, repo_name: str) -> Optional[int]:
+        """Get the installation ID for a given repository (owner/repo_name)."""
+        integration_client = self.get_integration_client()
+        repo_full_name = f"{owner}/{repo_name}"
+        
+        logger.debug(f"[get_installation_id_by_repo] Searching for repo {repo_full_name}")
+        
+        # List all installations for the app
+        try:
+            installations = integration_client.get_installations()
+            logger.debug(f"[get_installation_id_by_repo] Found {len(list(installations))} installations to check")
+        except Exception as e:
+            logger.error(f"[get_installation_id_by_repo] Failed to get installations: {e}")
+            return None
+        
+        # First, try direct repo access check (faster and more reliable)
+        for installation in installations:
+            try:
+                installation_id = installation.id
+                installation_token = self.get_installation_client(installation_id)
+                
+                # Try to directly access the repository - this is faster than listing all repos
+                repo_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+                headers = {
+                    "Authorization": f"token {installation_token}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                response = requests.get(repo_url, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    # CRITICAL: Check if repository is private
+                    repo_data = response.json()
+                    if repo_data.get("private"):
+                        logger.info(f"[get_installation_id_by_repo] Found installation ID {installation_id} for PRIVATE repo {repo_full_name}")
+                        return installation_id
+                    else:
+                        logger.info(f"[get_installation_id_by_repo] Repository {repo_full_name} is PUBLIC - returning 0")
+                        return 0  # Public repo, no internal token needs to be assigned
+                elif response.status_code == 404:
+                    # Repo doesn't exist or installation doesn't have access
+                    logger.debug(f"[get_installation_id_by_repo] Installation {installation_id} cannot access {repo_full_name} (404)")
+                    continue
+                else:
+                    logger.debug(f"[get_installation_id_by_repo] Installation {installation_id} returned status {response.status_code} for {repo_full_name}")
+                    continue
+            except requests.exceptions.RequestException as e:
+                logger.debug(f"[get_installation_id_by_repo] Request error checking installation {installation.id}: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"[get_installation_id_by_repo] Error checking installation {installation.id}: {e}")
+                continue
+        
+        # Fallback: If direct access didn't work, try listing repositories
+        logger.debug(f"[get_installation_id_by_repo] Direct access failed, trying repository list method")
+        for installation in installations:
+            try:
+                installation_id = installation.id
+                # Use the existing get_repositories method which uses the correct API endpoint
+                repos = self.get_repositories(installation_id, page=1, per_page=100)
+                
+                # Check if the target repo is in the list
+                if repo_full_name in repos:
+                    # CRITICAL: Check repository visibility before returning installation_id
+                    installation_token = self.get_installation_client(installation_id)
+                    repo_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+                    headers = {
+                        "Authorization": f"token {installation_token}",
+                        "Accept": "application/vnd.github.v3+json"
+                    }
+                    response = requests.get(repo_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        repo_data = response.json()
+                        if repo_data.get("private"):
+                            logger.info(f"[get_installation_id_by_repo] Found installation ID {installation_id} for PRIVATE repo {repo_full_name} (via repo list)")
+                            return installation_id
+                        else:
+                            logger.info(f"[get_installation_id_by_repo] Repository {repo_full_name} is PUBLIC - returning 0 (via repo list)")
+                            return 0  # Public repo, no internal token needs to be assigned
+                    else:
+                        # If we can't check, assume it's private for safety (to avoid exposing private repos)
+                        logger.warning(f"[get_installation_id_by_repo] Could not check visibility for {repo_full_name}, assuming private")
+                    return installation_id
+                
+                # If not found in first page, check additional pages
+                page = 2
+                while len(repos) == 100:  # If we got 100, there might be more
+                    try:
+                        more_repos = self.get_repositories(installation_id, page=page, per_page=100)
+                        if not more_repos:
+                            break
+                        repos.extend(more_repos)
+                        if repo_full_name in repos:
+                            # Check visibility when found in additional pages
+                            installation_token = self.get_installation_client(installation_id)
+                            repo_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+                            headers = {
+                                "Authorization": f"token {installation_token}",
+                                "Accept": "application/vnd.github.v3+json"
+                            }
+                            response = requests.get(repo_url, headers=headers, timeout=10)
+                            
+                            if response.status_code == 200:
+                                repo_data = response.json()
+                                if repo_data.get("private"):
+                                    logger.info(f"[get_installation_id_by_repo] Found installation ID {installation_id} for PRIVATE repo {repo_full_name} (via repo list, page {page})")
+                                    return installation_id
+                                else:
+                                    logger.info(f"[get_installation_id_by_repo] Repository {repo_full_name} is PUBLIC - returning 0 (via repo list, page {page})")
+                                    return 0
+                            else:
+                                logger.warning(f"[get_installation_id_by_repo] Could not check visibility for {repo_full_name} on page {page}, assuming private")
+                                return installation_id
+                        page += 1
+                    except requests.exceptions.HTTPError as e:
+                        if e.response.status_code == 404:
+                            # Installation doesn't exist or was deleted
+                            logger.debug(f"[get_installation_id_by_repo] Installation {installation_id} not found (404)")
+                        break
+                    except Exception as e:
+                        logger.debug(f"[get_installation_id_by_repo] Error getting repos for installation {installation_id} page {page}: {e}")
+                        break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    # Installation doesn't exist or was deleted
+                    logger.debug(f"[get_installation_id_by_repo] Installation {installation.id} not found (404)")
+                else:
+                    logger.warning(f"[get_installation_id_by_repo] HTTP error checking installation {installation.id}: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"[get_installation_id_by_repo] Error checking installation {installation.id}: {e}")
+                continue
+        
+        logger.warning(f"[get_installation_id_by_repo] No installation found for repo {repo_full_name} after checking all installations")
+        return None
+
+    def get_repositories(self, installation_id: int, page: int = 1, per_page: int = 100):
+        installation_token = self.get_installation_client(installation_id)
+        headers = {
+            "Authorization": f"token {installation_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        params = {
+            "per_page": per_page,
+            "page": page
+        }
+        
+        repos_url = "https://api.github.com/installation/repositories"
+        response = requests.get(repos_url, headers=headers, params=params)
+        response.raise_for_status() # Raise an exception for bad status codes
+        
+        repos_data = response.json()
+        
+        repos_list = []
+        for repo_info in repos_data.get("repositories", []):
+            repos_list.append(repo_info["full_name"])
+            
+        return repos_list
+
+    def count_all_repositories(self, installation_id: int) -> int:
+        """Count all repositories for an installation, handling pagination."""
+        installation_token = self.get_installation_client(installation_id)
+        headers = {
+            "Authorization": f"token {installation_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        repos_url = "https://api.github.com/installation/repositories"
+        total_count = 0
+        page = 1
+        per_page = 100
+        
+        while True:
+            params = {
+                "per_page": per_page,
+                "page": page
+            }
+            response = requests.get(repos_url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            repos_data = response.json()
